@@ -1,0 +1,656 @@
+---
+title: "Probable Dementia in SHARE"
+output:
+  html_document:
+    toc: yes
+---
+
+# Performance of probable dementia classification in a European multi-country survey
+
+
+## Setup
+
+The following code chunk installs and loads essential packages, data and sets the environment for analyses.
+
+```{r include = FALSE}
+# install and load packages
+source("./scripts/20240121_packages.R")
+source("./scripts/20240210_func.R")
+
+# set seed
+SEED = 123
+set.seed(SEED)
+
+# collect cores
+mc.cores = parallel::detectCores()
+doParallel::registerDoParallel(cores = mc.cores)
+
+knitr::opts_chunk$set(comment = NA)
+
+# needs to be run only once and outputs data for figure 1 flow chart illustrating sample size according to eligibility criteria
+#source("./scripts/20240124_data_merge_clean.R")
+#source("./scripts/20240208_data_prep.R")
+```
+
+```{r include = FALSE}
+# load training and testing data
+load("./data/_probdem_training_dat.RData")
+load("./data/_probdem_training_dat_down.RData")
+load("./data/_probdem_training_dat_smote.RData")
+load("./data/_probdem_test_dat.RData")
+
+#respondents at wave 7:  77202 
+#  at least 60 years old:  61324 
+#  no missings:  57880 
+#  no missings in interviewer variables:  57734 
+#  excluded due to low base prev and distinct, lower age distribution in Slovakia:  56622
+```
+
+## Model Training
+
+### Preprocessing
+
+Standardize Continuous Variables by 2 SDs and Create Dummies for Factors.
+
+```{r}
+countries = train_dat_w %>% group_by(country) %>% summarise(country = first(country))
+LW_vars = c("recall_sum", "iadl_sum", "recall_cutoff", 
+            "LW", "Q3", "Q3_greater_zero", "IADL_cutoff", "LW_iadl", "recall_cutoff_prev",
+            "LW_prev", "LW_iadl_prev")
+
+# full train
+train_dat_baked = data.frame()
+test_dat_baked = data.frame()
+for(i in 1:nrow(countries)){
+  
+  rec = recipe(
+    dementia_dbl ~ ., train_dat_w %>% 
+      filter(country == countries$country[i]) %>% 
+      mutate(dementia_dbl = as_factor(dementia_dbl),
+             # set those arbitrarily to allow application of same recipe in test/train data
+             mergeid = 1, cciw_w7 = 1, dementia_prev = 1,
+             probdem_LW = 1, probdem_LW_iadl = 1, probdem_LW_prev = 1,
+             probdem_LW_iadl_prev = 1)) %>% 
+    step_scale(all_of(c("cf008tot", "cf016tot", "age", "askclarification", "understood")), factor = 2) %>% 
+    step_dummy(all_of(c("isced", "reading", "willing", "proxy", "country"))) %>% 
+    prep()
+  
+  train_dat_baked_temp = juice(rec)
+  train_dat_baked = rbind(train_dat_baked, train_dat_baked_temp)
+  
+  # full test
+  test_dat_baked_temp = bake(rec, 
+                             new_data = test_dat_LW %>% 
+                               mutate(weights = 1) %>% 
+                               select(-all_of(LW_vars)) %>% 
+                               filter(country == countries$country[i]) %>% 
+                               mutate(dementia_dbl = as_factor(dementia_dbl)))
+  test_dat_baked = rbind(test_dat_baked, test_dat_baked_temp)
+}
+
+# train smote
+train_dat_baked_smote = data.frame()
+test_dat_baked_smote = data.frame()
+for(i in 1:nrow(countries)){
+  
+  rec_smote = recipe(
+    dementia_dbl ~ ., train_dat_smote %>% 
+      filter(country == countries$country[i]) %>% 
+      mutate(dementia_dbl = as_factor(dementia_dbl))) %>% 
+    step_scale(all_of(c("cf008tot", "cf016tot", "age", "askclarification", "understood")), factor = 2) %>% 
+    step_dummy(all_of(c("isced", "reading", "willing", "proxy", "country"))) %>% 
+    prep()
+  
+  train_dat_baked_temp = juice(rec_smote)
+  train_dat_baked_smote = rbind(train_dat_baked_smote, train_dat_baked_temp)
+  
+  # full test
+  test_dat_baked_temp = bake(rec_smote, 
+                             new_data = test_dat_LW %>% 
+                               select(-all_of(LW_vars)) %>% 
+                               filter(country == countries$country[i]) %>% 
+                               mutate(dementia_dbl = as_factor(dementia_dbl)))
+  test_dat_baked_smote = rbind(test_dat_baked_smote, test_dat_baked_temp)
+}
+
+# train down
+train_dat_baked_down = data.frame()
+test_dat_baked_down = data.frame()
+for(i in 1:nrow(countries)){
+  
+  rec_down = recipe(
+    dementia_dbl ~ ., train_dat_down %>% 
+      filter(country == countries$country[i]) %>% 
+      mutate(dementia_dbl = as_factor(dementia_dbl))) %>% 
+    step_scale(all_of(c("cf008tot", "cf016tot", "age", "askclarification", "understood")), factor = 2) %>% 
+    step_dummy(all_of(c("isced", "reading", "willing", "proxy", "country"))) %>% 
+    prep()
+  
+  train_dat_baked_temp = juice(rec_down)
+  train_dat_baked_down = rbind(train_dat_baked_down, train_dat_baked_temp)
+  
+  # full test
+  test_dat_baked_temp = bake(rec_down, 
+                             new_data = test_dat_LW %>% 
+                               select(-all_of(LW_vars)) %>% 
+                               filter(country == countries$country[i]) %>% 
+                               mutate(dementia_dbl = as_factor(dementia_dbl)))
+  test_dat_baked_down = rbind(test_dat_baked_down, test_dat_baked_temp)
+}
+```
+
+### Hyperparameter Tuning
+
+This needs to be run only once
+
+```{r}
+#source("./scripts/20240208_hyperparameter_tuning.R")
+```
+
+### Specify Logistic Regression and Random Forest Models
+
+```{r include = FALSE}
+# define predictive formula
+formula_iv = as.formula("dementia_dbl ~ cf008tot + cf016tot + age + is_female + isced_upper_secondary + isced_lower_secondary + iadl_meal + iadl_groceries + iadl_phone + iadl_medi + iadl_money + iadl_map + iadl_leaving + iadl_laundry + iadl_garden + adl_dressing + adl_walking + adl_bathing + adl_eating + adl_outofbed + adl_toilet + reading_help + willing_bad.at.some.time + proxy_partner + proxy_relatives + proxy_helper.other + askclarification + understood")
+```
+
+### Logistic Regression Models
+
+Training
+
+```{r include = FALSE, results = FALSE}
+log_glm_iv = glm(formula_iv, data = train_dat_baked, family = "binomial")
+log_glm_w_iv = svyglm(formula_iv, 
+                      svydesign(ids = ~1, 
+                                weights = ~weights, 
+                                data = as.data.frame(train_dat_baked) %>% 
+                                  mutate(dementia_dbl = as.numeric(as.character(dementia_dbl))), 
+                                family = "binomial"))
+log_glm_smote_iv = glm(formula_iv, data = train_dat_baked_smote, family = "binomial")
+log_glm_down_iv = glm(formula_iv, data = train_dat_baked_down, family = "binomial")
+```
+
+Prediction
+
+```{r include = FALSE, results = FALSE}
+test_dat_baked$pred_glm_iv = predict(log_glm_iv, newdata = test_dat_baked, type = "response")
+test_dat_baked$probdem_glm_iv = factor(ifelse(test_dat_baked$pred_glm_iv > .5, "dementia", "no dementia"))
+test_dat_baked$pred_glm_w_iv = predict(log_glm_w_iv, newdata = test_dat_baked, type = "response")
+test_dat_baked$probdem_glm_w_iv = factor(ifelse(test_dat_baked$pred_glm_w_iv > .5, "dementia", "no dementia"))
+test_dat_baked$pred_glm_smote_iv = predict(log_glm_smote_iv, newdata = test_dat_baked_smote, type = "response")
+test_dat_baked$probdem_glm_smote_iv = factor(ifelse(test_dat_baked$pred_glm_smote_iv > .5, "dementia", "no dementia"))
+test_dat_baked$pred_glm_down_iv = predict(log_glm_down_iv, newdata = test_dat_baked_down, type = "response")
+test_dat_baked$probdem_glm_down_iv = factor(ifelse(test_dat_baked$pred_glm_down_iv > .5, "dementia", "no dementia"))
+```
+
+### Random Forest
+
+Training
+
+```{r}
+# load tuned models
+load(file = "./data/rf_fit_iv.RData")
+load(file = "./data/rf_fit_smote_iv.RData")
+load(file = "./data/rf_fit_down_iv.RData")
+
+# model
+model_rf <- 
+  rand_forest(
+    mtry = tune(),         # Randomly Selected Predictors (type: integer)
+    trees = tune(),        # Trees (type: integer, default: 500L)
+    min_n = tune()) %>%    # Minimal Node Size (type: integer)
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+
+# workflow
+wkfl_rf_iv <- workflow() %>% add_formula(formula_iv) %>% add_model(model_rf)
+
+# train
+ranger_fit_iv <- wkfl_rf_iv %>% finalize_workflow(select_best(rf_fit_iv)) %>% fit(data = train_dat_baked)
+ranger_fit_smote_iv <- wkfl_rf_iv %>% finalize_workflow(select_best(rf_fit_smote_iv)) %>% fit(data = train_dat_baked_smote)
+ranger_fit_down_iv <- wkfl_rf_iv %>% finalize_workflow(select_best(rf_fit_down_iv)) %>% fit(data = train_dat_baked_down)
+```
+
+Prediction
+
+```{r}
+test_dat_baked$pred_ranger_iv = predict(ranger_fit_iv, test_dat_baked, type = "prob")$.pred_1
+test_dat_baked$probdem_ranger_iv = factor(ifelse(test_dat_baked$pred_ranger_iv > .5, "dementia", "no dementia"))
+test_dat_baked$pred_ranger_smote_iv = predict(ranger_fit_smote_iv, test_dat_baked_smote, type = "prob")$.pred_1
+test_dat_baked$probdem_ranger_smote_iv = factor(ifelse(test_dat_baked$pred_ranger_smote_iv > .5, "dementia", "no dementia"))
+test_dat_baked$pred_ranger_down_iv = predict(ranger_fit_down_iv, test_dat_baked_down, type = "prob")$.pred_1
+test_dat_baked$probdem_ranger_down_iv = factor(ifelse(test_dat_baked$pred_ranger_down_iv > .5, "dementia", "no dementia"))
+```
+
+
+### XGboost
+
+Training
+
+```{r message = FALSE, results = FALSE}
+# load tuned models
+load(file = "./data/xgb_fit_iv.RData")
+load(file = "./data/xgb_fit_smote_iv.RData")
+load(file = "./data/xgb_fit_down_iv.RData")
+
+# model
+model_xgboost <- 
+  boost_tree(
+    trees = tune(),
+    tree_depth = tune(),      ## model complexity
+    min_n = tune(),           ## model complexity
+    loss_reduction = tune(),  ## model complexity                   
+    sample_size = tune(),     ## randomness
+    mtry = tune(),            ## randomness        
+    learn_rate = tune()       ## step size                    
+  ) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# workflow
+wkfl_xgb_iv <- workflow() %>% add_formula(formula_iv) %>% add_model(model_xgboost)
+
+# train
+xgboost_fit_iv <- wkfl_xgb_iv %>% finalize_workflow(select_best(xgb_fit_iv)) %>% fit(data = train_dat_baked)
+xgboost_fit_smote_iv <- wkfl_xgb_iv %>% finalize_workflow(select_best(xgb_fit_smote_iv)) %>% fit(data = train_dat_baked_smote)
+xgboost_fit_down_iv <- wkfl_xgb_iv %>% finalize_workflow(select_best(xgb_fit_down_iv)) %>% fit(data = train_dat_baked_down)
+```
+
+Prediction
+
+```{r message = FALSE, results = FALSE}
+# without weights
+test_dat_baked$pred_xgb_iv = predict(xgboost_fit_iv, test_dat_baked, type = "prob")$.pred_1
+test_dat_baked$probdem_xgb_iv = factor(ifelse(test_dat_baked$pred_xgb_iv > .5, "dementia", "no dementia"))
+test_dat_baked$pred_xgb_smote_iv = predict(xgboost_fit_smote_iv, test_dat_baked_smote, type = "prob")$.pred_1
+test_dat_baked$probdem_xgb_smote_iv = factor(ifelse(test_dat_baked$pred_xgb_smote_iv > .5, "dementia", "no dementia"))
+test_dat_baked$pred_xgb_down_iv = predict(xgboost_fit_down_iv, test_dat_baked_down, type = "prob")$.pred_1
+test_dat_baked$probdem_xgb_down_iv = factor(ifelse(test_dat_baked$pred_xgb_down_iv > .5, "dementia", "no dementia"))
+```
+
+
+## Results
+
+### Table 1. Descriptive characteristics of the training and test set.
+
+```{r}
+table1_dat = train_dat_w %>% 
+  select(age, is_female, isced, dementia) %>% 
+  mutate(traintest = "Training Set") %>% 
+  rbind(train_dat_down %>%  
+          select(age, is_female, isced, dementia) %>%
+          mutate(traintest = "Downsampled Training Set")) %>% 
+  rbind(train_dat_smote %>%  
+          select(age, is_female, isced, dementia) %>%
+          mutate(traintest = "SMOTE Training Set")) %>% 
+  rbind(test_dat_LW %>%  
+          select(age, is_female, isced, dementia) %>%
+          mutate(traintest = "Test Set")) %>% 
+  mutate(Age = age,
+         Gender = ifelse(is_female == 1, "Female", "Male") %>% factor,
+         `Educational Level (ISCED 1997)` = case_when(
+           isced == "tertiary" ~ "Tertiary", 
+           isced == "upper_secondary" ~ "Upper Secondary", 
+           isced == "lower_secondary" ~ "Lower Secondary"),
+         Dementia = ifelse(dementia == "no dementia", "No Dementia", "Dementia") %>% factor)
+
+table1(~ Age + Gender + `Educational Level (ISCED 1997)` + Dementia | traintest, 
+       data = table1_dat %>% filter(traintest %in% c("Training Set", "Test Set")), 
+       overall = FALSE, 
+       extra.col = list(`P-value` = pvalue),
+       render.continuous=c(.="Mean (SD)"))
+
+table1(~ Age + Gender + `Educational Level (ISCED 1997)` + Dementia | traintest, 
+       data = table1_dat %>% filter(traintest %in% c("Downsampled Training Set", "Test Set")), 
+       overall = FALSE, 
+       extra.col = list(`P-value` = pvalue),
+       render.continuous=c(.="Mean (SD)"))
+
+table1(~ Age + Gender + `Educational Level (ISCED 1997)` + Dementia | traintest, 
+       data = table1_dat %>% filter(traintest %in% c("SMOTE Training Set", "Test Set")), 
+       overall = FALSE, 
+       extra.col = list(`P-value` = pvalue),
+       render.continuous=c(.="Mean (SD)"))
+```
+
+### Supplementary Table S2. Performance of algorithmic classifications in the test set.
+
+Define which algorithms and performance metrics to focus on.
+
+```{r echo = FALSE, message = FALSE, warning = FALSE}
+probdem_include = c("dementia", 
+                    "probdem_LW", "probdem_LW_prev", "probdem_LW_iadl", "probdem_LW_iadl_prev",
+                    "probdem_glm_iv", "probdem_glm_w_iv", "probdem_glm_down_iv", "probdem_glm_smote_iv",
+                    "probdem_ranger_iv", "probdem_ranger_down_iv", "probdem_ranger_smote_iv",
+                    "probdem_xgb_iv", "probdem_xgb_down_iv", "probdem_xgb_smote_iv")
+metrics = c("accuracy", "sensitivity", "specificity", "balanced_accuracy", "precision", "f1")
+```
+
+Compare performance metrics.
+
+```{r echo = FALSE, message = FALSE, warning = FALSE}
+AUC_df = AUC_func(test_dat_baked, probdem_include[-1])
+
+kable(tidy_model_comparison(probdem = probdem_include[-1], data = test_dat_baked, metrics = metrics) %>%
+        mutate(alg = rename_alg_short(alg)) %>% 
+        left_join(AUC_df),
+      booktabs = TRUE,
+      col.names = c("Classification", "Accuracy", "Balanced Accuracy", "Sensitivity", "Specificity",
+                    "Precision", "F1", "AUC"), 
+      align = c("l", "c", "c", "c", "c", "c", "c"),
+      digits = 2)
+```
+
+### Supplementary Table S3. Dementia prevalence and number of expected dementia cases across algorithms.
+
+Estimate underdiagnosis across all countries when using self-reports vs algorithmic classifications.
+
+```{r}
+SHARE_prevalence_weighted = weighted_class_prev_per_country(
+  # weights need to be removed to avoid malfunction of svytable
+  dat_with_probdem = test_dat_baked %>% select(-weights), 
+  dat_with_country = test_dat_LW)
+
+under_mean_cl = data.frame(Classification = rename_alg(probdem_include[c(1,5,7,12,15)])) %>% 
+  mutate(Classification = factor(Classification, 
+                                 levels = c("Self-report", 
+                                            "LW (Recall & IADL)^'P'", 
+                                            "Logistic Regression weighted", 
+                                            "Random Forest SMOTE",
+                                            "XGBoost SMOTE"))) %>% 
+  cbind(data.frame(rbind(
+    mean_cl_normal(1 - (SHARE_prevalence_weighted$Ndemfactual_dementia/SHARE_prevalence_weighted$Ndemexpected)),
+    mean_cl_normal(1 - (SHARE_prevalence_weighted$Ndemfactual_LW/SHARE_prevalence_weighted$Ndemexpected)),
+    mean_cl_normal(1 - (SHARE_prevalence_weighted$Ndemfactual_GLM_w/SHARE_prevalence_weighted$Ndemexpected)),
+    mean_cl_normal(1 - (SHARE_prevalence_weighted$Ndemfactual_Ranger/SHARE_prevalence_weighted$Ndemexpected)),
+    mean_cl_normal(1 - (SHARE_prevalence_weighted$Ndemfactual_XGB/SHARE_prevalence_weighted$Ndemexpected)))))
+```
+
+```{r}
+table_s3 = SHARE_prevalence_weighted %>% 
+  select(country, n, dementia_prev, Ndemexpected, 
+         `Self-report`, Ndemfactual_dementia, 
+         `LW (Recall & IADL)^'P'`, Ndemfactual_LW, 
+         `Logistic Regression weighted`, Ndemfactual_GLM_w, 
+         `Random Forest SMOTE`, Ndemfactual_Ranger, 
+         `XGBoost SMOTE`, Ndemfactual_XGB) %>% 
+  mutate_if(is.double, function(x) x = round(ifelse(x < 1, x*100, x), digits = 2)) %>%
+  arrange(as.character(country))
+
+# total  
+table_s3 %>% 
+  select(n, Ndemexpected, Ndemfactual_dementia, Ndemfactual_LW, Ndemfactual_GLM_w, Ndemfactual_Ranger, Ndemfactual_XGB) %>% 
+  summarise_all(~sum(.))
+
+table_s3
+```
+
+### Figure 2
+
+```{r echo = FALSE, message = FALSE, warning = FALSE}
+perfall = tidy_model_comparison(probdem = probdem_include[c(5,7,12,15)], data = test_dat_baked, metrics = metrics) %>% 
+    mutate(`Algorithm type` = factor(case_when(
+               grepl("LW", alg) ~ "LW",
+               grepl("glm", alg) ~ "GLM",
+               grepl("xgb", alg) ~ "XGB",
+               grepl("ranger", alg) ~ "RF"), levels = c("LW", "GLM", "RF", "XGB")),
+           alg = rename_alg_short(alg)) %>%
+    ggplot(aes(sensitivity, specificity, label = alg, shape = `Algorithm type`)) +
+    scale_color_viridis_d(option = "viridis", end = .8, guide = "none", direction = -1) +
+    scale_fill_viridis_d(option = "viridis", end = .8) +
+    geom_point(size = 4, aes(fill = `Algorithm type`)) + 
+    scale_shape_manual(values = c(24:21)) +
+    geom_text_repel(max.overlaps = 15, size = 5, force_pull = 0, parse = T) +
+    xlim(c(.1, 1)) +
+    ylim(c(.9, 1)) +
+    theme_minimal() + xlab("Sensitivity") + ylab("Specificity") + 
+    theme(axis.title = element_text(size = 18, face = "bold"), 
+          text = element_text(size = 18), legend.position = "bottom",
+          panel.border = element_blank(), axis.line = element_line())
+
+#png(filename = "./plots/20240208_perfall_bw.png", res = 1200, width = 7, height = 7, units = "in", type = 'cairo')
+edit_colors(perfall, desaturate) %>% ggdraw()
+#dev.off()
+```
+
+### Figure 3
+
+```{r}
+# set coordinates with country-level prevalence based on classifications
+world = create_world(weighted_class_prev_per_country = SHARE_prevalence_weighted)
+Europe <- world %>% drop_na(Ndemexpected)
+```
+
+Create a base plot. Points reflect population-level prevalence per country according to OECD estimates (x axis) and SHARE (y axis).
+
+```{r}
+# exclude not included countries and focus on self-reports and LW (Recall & IADL)
+Europe_long = Europe %>% 
+  pivot_longer(cols = c("Self-report", "LW (Recall & IADL)^'P'"), names_to = "Classification", values_to = "prev") %>%  
+  mutate(Classification = factor(case_when(
+    Classification == "Self-report" ~ "Self-Reported Physician-Diagnosis",
+    Classification == "LW (Recall & IADL)^'P'" ~ "LW (Recall & IADL)^'P'"), 
+    levels = c("Self-Reported Physician-Diagnosis", "LW (Recall & IADL)^'P'")))
+
+# base plot
+underdiagnosis = Europe_long %>% 
+  ggplot(aes(OECD, prev, label = iso_a2)) + 
+  geom_abline(slope = 1, intercept = 0, size = 2, linetype = "dashed", colour = "#CEC2D7") +
+  scale_shape_manual(name = "Classification",
+                     values = c("Self-Reported Physician-Diagnosis" = 18,  
+                                "LW (Recall & IADL)^'P'" = 17), 
+                     labels = c("Self-Reported Physician-Diagnosis", parse(text = "'LW (Recall & IADL)'^'P'"))) + # was 19 and 17
+  # Colour
+  scale_color_manual(name = "Classification",
+                     values = c("Self-Reported Physician-Diagnosis" = "#F41711", 
+                                "LW (Recall & IADL)^'P'" = "#39A8DE"),
+                     labels = c("Self-Reported Physician-Diagnosis", parse(text = "'LW (Recall & IADL)'^'P'"))) +
+  scale_fill_manual(name = "Classification", 
+                    values = c("Self-Reported Physician-Diagnosis" = "#F41711", 
+                               "LW (Recall & IADL)^'P'" = "#39A8DE"),
+                    labels = c("Self-Reported Physician-Diagnosis", parse(text = "'LW (Recall & IADL)'^'P'"))) +
+  # BW
+  #scale_color_manual(values = c("Self-report" = "grey70", "LW (Recall & IADL)*" = "black"), guide = "none") +
+  #scale_fill_manual(name = "Classification", 
+  #                  values = c("Self-report" = "grey70", "LW (Recall & IADL)^'P'" = "black"),
+  #                  labels = c("Self-Reported Physician-Diagnosis", parse(text = "'LW (Recall & IADL)'^'P'"))) +
+  coord_equal(ratio = 1, xlim = c(0, 9), ylim = c(0, 9)) +
+  theme_minimal() + 
+  theme(axis.line = element_line(), legend.position = c(.25, .9), legend.text.align = c(0), panel.grid = element_blank(),
+        text = element_text(size = 34)) +
+  labs(x = "OECD Projected Dementia Prevalence 2018 (%)", y = "SHARE Dementia Prevalence 2017 (%)")
+```
+
+Add country labels and linear trend for self-reports.
+
+```{r}
+# plot with country labels and linear smoothing for self-reports
+#png(filename = "./plots/20230324_underdiagnosis_bw.png", res = 1200, width = 16, height = 16, units = "in")
+edit_colors(underdiagnosis + 
+  theme(legend.position = "none") + 
+    geom_point(data = Europe_long %>% filter(Classification == "Self-Reported Physician-Diagnosis"), 
+             aes(colour = Classification, shape = Classification), size = 5) +
+  geom_text_repel(data = Europe_long %>% filter(Classification == "Self-Reported Physician-Diagnosis"), size = 9, direction = "x", point.size = 6) +
+  geom_smooth(data = Europe_long %>% filter(Classification == "Self-Reported Physician-Diagnosis"), method = "lm", aes(colour = Classification, fill = Classification), alpha = .2),
+  desaturate) %>% 
+  ggdraw()
+#dev.off()
+```
+
+Add country labels and linear trend for LW classification based on recall and IADL with prevalence-based cutoffs.
+
+```{r}
+# plot with country labels and linear smoothing for self-reports and classifications
+#png(filename = "./plots/20240208_underdiagnosis2.png", res = 1200, width = 16, height = 16, units = "in", type = 'cairo')
+underdiagnosis +
+  geom_line(aes(group = country), linetype = "twodash", size = 1.1, alpha = .3) + 
+  geom_point(data = Europe_long, 
+             aes(colour = Classification, shape = Classification), size = 7) +
+  geom_text_repel(data = Europe_long %>% filter(Classification != "Self-Reported Physician-Diagnosis"), size = 9, direction = "x", point.size = 6) +
+  geom_smooth(method = "lm", aes(colour = Classification, fill = Classification), alpha = .2)
+#dev.off()
+```
+
+### Figure 4
+
+```{r}
+#png(filename = "./plots/20240208_underdiagnosispct_bw.png", res = 1200, width = 9, height = 6, units = "in", type = 'cairo')
+edit_colors(under_mean_cl %>%
+  filter(Classification != "Self-report") %>% 
+  ggplot(aes(Classification, y, ymin = ymin, ymax = ymax, fill = Classification, colour = Classification)) +
+  geom_col() +
+  geom_point(size = 4, colour = 'black') +
+  geom_errorbar(width = .4, color = "black") +
+  geom_hline(yintercept = 0, colour = "black", linetype = "solid") +
+  geom_hline(yintercept = under_mean_cl$y[under_mean_cl$Classification == "Self-report"], colour = "red", linetype = "dashed") + 
+  geom_rect(data = under_mean_cl[under_mean_cl$Classification == "Self-report",], inherit.aes = F,
+              aes(xmin = -Inf, xmax = Inf, ymin = ymin, ymax = ymax), fill="red", alpha=.2) +
+  scale_y_continuous(breaks = pretty_breaks(n = 5), labels = percent_format(accuracy = 1)) +
+  scale_x_discrete(labels = c(parse(text = 
+    "'LW (Recall & IADL)'^'P'"),
+    "GLM (weighted)",
+    "RF SMOTE",
+    "XGB SMOTE")) +
+  scale_colour_viridis_d(guide = "none", end = .8) +
+  scale_fill_viridis_d(guide = "none", end = .8) +
+  coord_cartesian(ylim = c(-100, 100)) +
+  coord_flip() + 
+  ylab("Mean (95% CI) Underreporting") + xlab("") +
+  theme_minimal() +
+  theme(text = element_text(size = 20), axis.line = element_line()),
+  desaturate) %>% 
+  ggdraw()
+#dev.off()
+```
+
+```{r}
+underdiff = SHARE_prevalence_weighted %>% 
+    select(country, Ndemfactual_dementia, Ndemfactual_LW, Ndemexpected) %>% 
+    mutate(underdem = SHARE_prevalence_weighted$Ndemfactual_dementia/SHARE_prevalence_weighted$Ndemexpected,
+           underlw = SHARE_prevalence_weighted$Ndemfactual_LW/SHARE_prevalence_weighted$Ndemexpected)
+
+t.test(underdiff$underdem, underdiff$underlw, paired = T)
+```
+
+
+### Figure 5
+
+Prevalence per country. The darker the colour, the higher the prevalence. Prevalence higher than 10 % is denoted in light grey, likely overestimated.
+
+```{r}
+#png(filename = "./plots/20230324_maps.png", res = 1200, width = 13.14, height = 13.33, units = "in", type = 'cairo')
+ggarrange(plot_prev_per_country(prev_source = "OECD", Europe = Europe),
+          plot_prev_per_country(prev_source = "Self-report", Europe = Europe),
+          plot_prev_per_country(prev_source = "LW (Recall & IADL)^'P'", Europe = Europe),
+          plot_prev_per_country(prev_source = "GLM (weighted)", Europe = Europe),
+          plot_prev_per_country(prev_source = "RF SMOTE", Europe = Europe),
+          plot_prev_per_country(prev_source = "XGB SMOTE", Europe = Europe), 
+          common.legend = T, nrow = 2, ncol = 3, labels = c('A', 'B', 'C', 'D', 'E', 'F'), 
+          font.label = list(size = 24, font = 'bold'), hjust=-1.5)
+#dev.off()
+```
+
+### Figure 6
+
+Create plot data.
+
+```{r}
+domains_data = test_dat_LW %>%  
+  mutate(Age = age,
+             `Grip Strength (kg)` = ifelse(maxgrip > 0, maxgrip, NA),
+             `Euro-Depression Scale` = as.double(eurod),
+             `Orientation to Date` = as.double(orienti),
+             `Percentage Calculation Performance` = numeracy, 
+             `Numeracy Performance` = as.double(numeracy2),
+             `Verbal Fluency` = vfluency) %>% 
+  left_join(test_dat_baked %>% select(mergeid, dementia, contains("probdem")))
+```
+
+Higher Scores indicate better performance. Higher scores for EURO-D show higher depressive symptoms.
+
+```{r}
+variables = c("Age", "Euro-Depression Scale", "Grip Strength (kg)", "Orientation to Date", "Numeracy Performance", "Verbal Fluency")
+
+#png(filename = "./plots/20240125_figure2_bw.png", res = 1200, width = 17, height = 17, units = "in", type = 'cairo')
+edit_colors(sub_figure_6("dementia", domains_data, variables), desaturate) %>% ggdraw()
+#dev.off()
+```
+
+
+### Supplementary Figure S4
+
+```{r echo = FALSE, message = FALSE, warning = FALSE}
+res_tab = data.frame(alg = NULL, Accuracy = NULL, `Balanced Accuracy` = NULL, Sensitivity = NULL, Specificity = NULL, Precision = NULL, F1 = NULL, AUC = NULL, country = NULL)
+
+for(i in 1:nrow(countries)){
+  # filter by country
+  test_dat_baked_temp = test_dat_baked %>% 
+    # both are ordered by country
+    left_join(test_dat_LW %>% select(mergeid, country)) %>% 
+    filter(country == countries$country[i])
+  
+  # calc AUC
+  AUC_df_temp = AUC_func(test_dat_baked_temp, probdem_include[-1])
+  
+  # create performance tab
+  temp_tab = tidy_model_comparison(probdem = probdem_include[c(5,7,12,15)], 
+                                   data = test_dat_baked_temp, 
+                                   metrics = metrics) %>% 
+    mutate(country = countries$country[i],
+           alg = rename_alg_short(alg)) %>% 
+    left_join(AUC_df_temp)
+    
+  res_tab = rbind(res_tab, temp_tab)
+}
+
+res_tab2 = res_tab %>% 
+  pivot_longer(cols = c(accuracy, balanced_accuracy, sensitivity, specificity, precision, f1, AUC), 
+               names_to = "metric",
+               values_to = "value") %>% 
+  mutate(Classification = factor(alg, 
+                                 levels = c("'LW (Recall & IADL)'^'P'", "'GLM weighted'", "'RF SMOTE'", "'XGB SMOTE'")),
+         metric = recode(metric,
+                         "accuracy" = "Accuracy",
+                         "balanced_accuracy" = "Balanced Accuracy", 
+                         "sensitivity" = "Sensitivity",
+                         "specificity" = "Specificity",
+                         "precision" = "Precision",
+                         "f1" = "F1"))
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#png(filename = "./plots/20240208_perfpercountry2_bw.png", res = 1200, width = 26, height = 9, units = "in", type = 'cairo')
+edit_colors(res_tab2 %>% 
+    ggplot(aes(value, Classification, colour = Classification, shape = Classification, label = country)) +
+    geom_boxplot() +
+    geom_beeswarm(groupOnX = F, size = 7) +
+    scale_shape_manual(values = c(24:21)) +
+    scale_shape_manual(name = "Classification",
+                       values = c("'LW (Recall & IADL)'^'P'" = 17,
+                                  "'GLM weighted'" = 24,
+                                  "'RF SMOTE'" = 23,
+                                  "'XGB SMOTE'" = 22),
+                       labels = c(parse(text = "'LW (Recall & IADL)'^'P'"),
+                                  "GLM weighted",
+                                  "RF SMOTE",
+                                  "XGB SMOTE")) + 
+    facet_wrap(~ factor(metric), nrow = 1) +
+    theme_bw() +
+    theme(legend.position = "bottom", text = element_text(size = 30), axis.text.x = element_blank(), 
+          axis.ticks.x = element_blank(), panel.spacing = unit(1.5, "lines")) +
+    xlab("") + ylab("") +
+    scale_colour_viridis_d(end = .8,
+                           labels = c(parse(text = "'LW (Recall & IADL)'^'P'"),
+                                      "GLM weighted",
+                                      "RF SMOTE",
+                                      "XGB SMOTE")) +
+    coord_flip() +
+    #geom_label_repel() +
+    scale_x_continuous(breaks = pretty_breaks(n = 5)),
+    desaturate) %>% 
+  ggdraw()
+#dev.off()
+```
+
+
